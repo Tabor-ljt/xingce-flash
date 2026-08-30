@@ -1,0 +1,17 @@
+{
+  "name": "上岸闪记 · 行测题眼速记",
+  "short_name": "上岸闪记",
+  "description": "在职考公人的碎片化时间行测题眼记忆工具：闪卡间隔重复、连连看、关键词填空、限时闯关",
+  "start_url": ".",
+  "scope": ".",
+  "display": "standalone",
+  "orientation": "portrait",
+  "background_color": "#f4f6fb",
+  "theme_color": "#4f6ef7",
+  "lang": "zh-CN",
+  "icons": [
+    { "src": "icons/icon-192.png", "sizes": "192x192", "type": "image/png", "purpose": "any" },
+    { "src": "icons/icon-512.png", "sizes": "512x512", "type": "image/png", "purpose": "any" },
+    { "src": "icons/icon-512.png", "sizes": "512x512", "type": "image/png", "purpose": "maskable" }
+  ]
+}
