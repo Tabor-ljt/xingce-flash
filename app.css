@@ -181,6 +181,48 @@ input { font-family: inherit; }
 .session-body { flex: 1; padding: 8px 18px 20px; overflow-y: auto; display: flex; flex-direction: column; }
 .session-foot { padding: 10px 18px calc(16px + env(safe-area-inset-bottom)); }
 
+/* --- 题眼识别 --- */
+.identify-hud { display: flex; align-items: center; gap: 12px; padding: 2px 2px 8px; }
+.identify-explain {
+  margin-top: 4px; background: var(--card); border-radius: 14px; box-shadow: var(--shadow);
+  padding: 12px 14px; display: flex; flex-direction: column; gap: 6px; animation: fadeUp .25s ease;
+}
+.ie-line { font-size: 13.5px; line-height: 1.6; color: var(--text-2); }
+.ie-ans { font-size: 14.5px; font-weight: 700; color: var(--text); }
+
+/* --- 错因标签 --- */
+.err-cause { margin-top: 8px; }
+.err-cause .ec-label { font-size: 12px; color: var(--text-3); font-weight: 700; margin-bottom: 6px; }
+.err-chips { display: flex; flex-wrap: wrap; gap: 7px; }
+.err-chip {
+  font-size: 12.5px; font-weight: 600; padding: 7px 11px; border-radius: 20px;
+  background: var(--card-2); color: var(--text-2); border: 1.5px solid transparent; transition: transform .1s;
+}
+.err-chip:active { transform: scale(.93); border-color: var(--primary); color: var(--primary); }
+.err-inline { margin-top: 10px; animation: fadeUp .2s ease; }
+.err-recorded { font-size: 12.5px; font-weight: 600; color: var(--green); background: var(--green-soft); border-radius: 12px; padding: 9px 13px; animation: fadeUp .2s ease; }
+.mode-btn.off { opacity: .45; }
+
+/* --- 弱项诊断 --- */
+.diagnosis-hint {
+  background: var(--card); border-radius: 14px; box-shadow: var(--shadow);
+  padding: 12px 14px; margin-bottom: 4px; font-size: 13px; color: var(--text-2);
+  display: flex; align-items: center; gap: 4px; transition: transform .1s;
+}
+.diagnosis-hint:active { transform: scale(.98); }
+.diagnosis-hint b { color: var(--text); }
+.bar-row { display: flex; align-items: center; gap: 8px; margin-bottom: 7px; }
+.bar-row .bar-name { width: 96px; font-size: 12px; color: var(--text-2); font-weight: 600; flex-shrink: 0; }
+.bar-row .bar-track { flex: 1; height: 9px; background: var(--card-2); border-radius: 5px; overflow: hidden; }
+.bar-row .bar-track i { display: block; height: 100%; min-width: 4px; background: linear-gradient(90deg, var(--red), #f97316); border-radius: 5px; }
+.bar-row .bar-track i.warm { background: linear-gradient(90deg, var(--amber), #f59e0b); }
+.bar-row .bar-n { width: 34px; text-align: right; font-size: 12px; color: var(--text-3); font-variant-numeric: tabular-nums; flex-shrink: 0; }
+.advice-box {
+  background: var(--primary-soft); color: var(--primary); border-radius: 14px;
+  padding: 12px 14px; font-size: 13.5px; line-height: 1.7; margin: 0 0 4px; font-weight: 600;
+}
+.advice-box b { color: var(--text); }
+
 /* --- 闪卡 --- */
 .flip-wrap { perspective: 1200px; flex: 1; display: flex; margin: 8px 0 14px; min-height: 300px; }
 .flip-card {

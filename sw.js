@@ -1,5 +1,5 @@
 /* 上岸闪记 Service Worker：缓存优先 + 后台更新，保证地铁离线可用 */
-const CACHE = 'xingce-flash-v1';
+const CACHE = 'xingce-flash-v2';
 const ASSETS = [
   './',
   'index.html',

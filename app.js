@@ -16,23 +16,36 @@ function cleanBack(s) { return String(s).replace(/^(解法|答案要点)：/, ''
 const DB = window.XINGCE_DB || { modules: [] };
 const CARDS = [];
 const CARD_BY_ID = {};
+const IQS = []; // 题眼识别训练题
 DB.modules.forEach(m => m.topics.forEach(t => t.cards.forEach(c => {
   c.moduleId = m.moduleId; c.moduleName = m.moduleName; c.moduleIcon = m.icon;
   c.topicId = t.id; c.topicName = t.name; c.section = t.section || '';
   CARDS.push(c); CARD_BY_ID[c.id] = c;
 })));
 const TOTAL = CARDS.length;
+DB.modules.forEach(m => (m.identify || []).forEach(q => {
+  q.moduleId = m.moduleId; q.moduleName = m.moduleName; q.moduleIcon = m.icon;
+  const t = m.topics.find(x => x.id === q.topicId);
+  q.topicName = t ? t.name : m.moduleName;
+  IQS.push(q);
+}));
 
 /* ---------- 进度存储 ---------- */
 const STORE_KEY = 'xingce_flash_v1';
 let progress = null;
 function defaultProgress() {
-  return { v: 1, cards: {}, stats: { streak: 0, lastDay: '', totalReviews: 0, days: {}, since: todayStr() }, best: {}, settings: { theme: 'auto' } };
+  return { v: 1, cards: {}, stats: { streak: 0, lastDay: '', totalReviews: 0, days: {}, since: todayStr() }, best: {}, attempts: [], settings: { theme: 'auto' } };
 }
 function loadProgress() {
   try {
     const raw = localStorage.getItem(STORE_KEY);
-    if (raw) { const p = JSON.parse(raw); if (p && p.v === 1) return p; }
+    if (raw) {
+      const p = JSON.parse(raw);
+      if (p && p.v === 1) {
+        if (!Array.isArray(p.attempts)) p.attempts = []; // 兼容旧版进度
+        return p;
+      }
+    }
   } catch (e) { }
   return defaultProgress();
 }
@@ -77,6 +90,72 @@ function dueCards() { const t = todayStr(); return CARDS.filter(c => isDue(c.id,
 function newCards() { return CARDS.filter(c => !progress.cards[c.id] || progress.cards[c.id].reps === 0); }
 function masteredCount() { return CARDS.filter(c => isMastered(c.id)).length; }
 
+/* ---------- 作答记录（错因诊断 + 反应时间） ---------- */
+const ERR_TYPES = [
+  { k: 'unknown', label: '不认识题型' },
+  { k: 'method', label: '方法选错' },
+  { k: 'calc', label: '计算错误' },
+  { k: 'misread', label: '漏看/误读条件' },
+  { k: 'hesitate', label: '选项间犹豫' },
+  { k: 'slow', label: '会做但太慢' },
+  { k: 'blank', label: '完全不会' },
+];
+const ERR_LABEL = Object.fromEntries(ERR_TYPES.map(e => [e.k, e.label]));
+function logAttempt(rec) { // rec: {kind,id,moduleId,topicId,topicName,mode,ok,rt,err}
+  rec.ts = Date.now();
+  progress.attempts.push(rec);
+  if (progress.attempts.length > 800) progress.attempts = progress.attempts.slice(-800);
+  saveProgress();
+  return rec;
+}
+function tagAttemptError(rec, k) {
+  if (!rec || rec.err) return;
+  rec.err = k; saveProgress();
+  toast('已记录错因：' + (ERR_LABEL[k] || k) + '，会加大该类题训练权重');
+}
+function iqScopeCards(q) { return scopeCards({ type: 'topic', moduleId: q.moduleId, topicId: q.topicId }); }
+function scopeIqs(sc) {
+  if (sc.type === 'all') return IQS.slice();
+  if (sc.type === 'module') return IQS.filter(q => q.moduleId === sc.moduleId);
+  return IQS.filter(q => q.moduleId === sc.moduleId && q.topicId === sc.topicId);
+}
+function expandIqScope(sc) { // 识别题太少时扩大到模块→全部
+  let qs = scopeIqs(sc);
+  if (qs.length >= 4 || sc.type === 'all') return { scope: sc, qs };
+  const ms = { type: 'module', moduleId: sc.moduleId };
+  qs = scopeIqs(ms);
+  if (qs.length >= 4) return { scope: ms, qs };
+  return { scope: { type: 'all' }, qs: IQS.slice() };
+}
+/* 按题型聚合正确率/耗时/错因，答错越久权重越低（半衰期7天） */
+function topicWeakness() {
+  const now = Date.now(), out = {};
+  for (const a of progress.attempts) {
+    const key = a.moduleId + '/' + a.topicId;
+    let w = out[key];
+    if (!w) w = out[key] = { moduleId: a.moduleId, topicId: a.topicId, topicName: a.topicName || '', moduleName: a.moduleName || '', n: 0, wsum: 0, csum: 0, rsum: 0, rn: 0, errs: {}, last: 0 };
+    const age = (now - a.ts) / 864e5;
+    const decay = Math.pow(0.5, age / 7);
+    w.n++; w.wsum += decay;
+    if (a.ok) w.csum += decay;
+    if (a.rt > 0) { w.rsum += a.rt; w.rn++; }
+    if (a.err) w.errs[a.err] = (w.errs[a.err] || 0) + 1;
+    if (a.ts > w.last) w.last = a.ts;
+  }
+  return out;
+}
+function weakestTopic(minN) {
+  const w = topicWeakness();
+  let best = null;
+  for (const k in w) {
+    const t = w[k];
+    if (t.n < (minN || 5)) continue;
+    const acc = t.csum / t.wsum;
+    if (!best || acc < best.acc) best = { key: k, topicName: t.topicName, moduleName: t.moduleName, moduleId: t.moduleId, topicId: t.topicId, acc, n: t.n };
+  }
+  return best;
+}
+
 /* ---------- 范围（Scope） ---------- */
 function scopeKey(sc) { return sc.type === 'all' ? 'all' : sc.type === 'module' ? sc.moduleId : sc.moduleId + '/' + sc.topicId; }
 function scopeName(sc) {
@@ -115,7 +194,7 @@ function go(name, params) { stack.push(route); route = Object.assign({ name }, p
 function goBack() { if (stack.length) { route = stack.pop(); render(); } }
 function switchTab(tab) { stack.length = 0; route = { name: tab }; render(); window.scrollTo(0, 0); }
 
-const TITLES = { home: '上岸闪记', browse: '题库', review: '今日复习', profile: '我的' };
+const TITLES = { home: '上岸闪记', browse: '题库', review: '今日复习', profile: '我的', diagnosis: '弱项诊断' };
 
 function render() {
   const r = route;
@@ -135,6 +214,7 @@ function render() {
   else if (r.name === 'topic') view.innerHTML = vTopic(r.moduleId, r.topicId);
   else if (r.name === 'review') view.innerHTML = vReview();
   else if (r.name === 'profile') view.innerHTML = vProfile();
+  else if (r.name === 'diagnosis') view.innerHTML = vDiagnosis();
   updateBadge();
 }
 
@@ -153,20 +233,24 @@ function progressBar(done, total) {
 function moduleRow(m) {
   const ids = []; m.topics.forEach(t => t.cards.forEach(c => ids.push(c.id)));
   const master = ids.filter(isMastered).length;
+  const nIq = (m.identify || []).length;
   return '<div class="module-row" data-action="open-module" data-id="' + m.moduleId + '">' +
     '<div class="module-icon">' + m.icon + '</div>' +
     '<div class="module-info"><div class="module-name">' + esc(m.moduleName) + '</div>' +
-    '<div class="module-sub">' + m.topics.length + ' 个题型 · ' + ids.length + ' 张卡 · 已掌握 ' + master + '</div>' +
+    '<div class="module-sub">' + m.topics.length + ' 个题型 · ' + ids.length + ' 张卡' + (nIq ? ' · ' + nIq + ' 道识别题' : '') + ' · 已掌握 ' + master + '</div>' +
     progressBar(master, ids.length) + '</div>' +
     '<svg class="chevron" viewBox="0 0 24 24" width="20" height="20"><path fill="currentColor" d="M9.3 6.7 8 8l5.3 4L8 16l1.3 1.3L16 12z"/></svg></div>';
 }
 function modeGrid(sc) {
   const scJson = esc(JSON.stringify(sc));
+  const nIq = scopeIqs(sc).length;
   return '<div class="mode-grid">' +
+    '<button class="mode-btn' + (nIq ? '' : ' off') + '" data-action="start-identify" data-scope="' + scJson + '"><div class="m-icon">🎯</div><div class="m-name">题眼识别</div><div class="m-desc">' + (nIq ? '真题干·8秒判第一步' : '本题型暂无识别题') + '</div></button>' +
     '<button class="mode-btn" data-action="start-flash" data-scope="' + scJson + '"><div class="m-icon">🃏</div><div class="m-name">闪卡记忆</div><div class="m-desc">翻面回忆·间隔重复</div></button>' +
     '<button class="mode-btn" data-action="start-match" data-scope="' + scJson + '"><div class="m-icon">🔗</div><div class="m-name">连连看</div><div class="m-desc">题眼配对关键词</div></button>' +
     '<button class="mode-btn" data-action="start-fill" data-scope="' + scJson + '"><div class="m-icon">✍️</div><div class="m-name">关键词填空</div><div class="m-desc">看题眼选解法词</div></button>' +
     '<button class="mode-btn" data-action="start-challenge" data-scope="' + scJson + '"><div class="m-icon">⚡</div><div class="m-name">限时闯关</div><div class="m-desc">3分钟·连击得分</div></button>' +
+    '<button class="mode-btn" data-action="open-diagnosis"><div class="m-icon">🩺</div><div class="m-name">弱项诊断</div><div class="m-desc">错因画像·推荐补练</div></button>' +
     '</div>';
 }
 function statusDot(st) { return '<span class="status-dot ' + (st === 'new' ? '' : st) + '"></span>'; }
@@ -193,6 +277,11 @@ function vHome() {
   }
   h += '<div style="height:10px"></div>' +
     '<button class="big-btn ghost" data-action="start-challenge" data-scope="' + esc(JSON.stringify(ALL_SCOPE)) + '">⚡ 随机闯关 · 3分钟限时挑战' + (best ? '（最佳 ' + best + ' 分）' : '') + '</button>';
+  const weak = weakestTopic(3);
+  if (weak) {
+    h += '<div style="height:10px"></div>' +
+      '<div class="diagnosis-hint" data-action="open-diagnosis">🩺 诊断建议：<b>' + esc(weak.topicName || weak.moduleName) + '</b> 正确率 ' + Math.round(weak.acc * 100) + '%（近 ' + weak.n + ' 次），点击查看错因画像 <span class="chevron" style="display:inline">›</span></div>';
+  }
   h += '<div class="section-title">选择模块 · 针对性刷题</div>';
   DB.modules.forEach(m => h += moduleRow(m));
   h += '<div class="note-text">题库 ' + TOTAL + ' 张卡片 · 数据更新 ' + esc(DB.buildDate || '') + '<br>方法论：主动回忆 + 间隔重复（记忆曲线）</div>';
@@ -292,6 +381,69 @@ function vReview() {
   return h;
 }
 
+/* ---------- 视图：弱项诊断 ---------- */
+const ERR_ADVICE = {
+  unknown: { t: '不认识题型', s: '先用<b>闪卡</b>过题眼特征，再练<b>题眼识别</b>建立条件反射' },
+  method: { t: '方法选错', s: '多练<b>题眼识别</b>与<b>易混对比</b>，重点看解析里的"易误判"' },
+  calc: { t: '计算出错', s: '方法没问题，练<b>限时闯关</b>提升速算，别死背公式' },
+  misread: { t: '漏看/误读条件', s: '做题时圈画主体/客体/问法，用<b>填空模式</b>强化关键词敏感度' },
+  hesitate: { t: '选项犹豫', s: '练<b>连连看</b>加快第一判断，犹豫超 20 秒先选倾向项' },
+  slow: { t: '会做但太慢', s: '用<b>限时闯关</b>压节奏，牢记该类题的标准起手式' },
+  blank: { t: '完全不会', s: '该考点先回<b>闪卡</b>学一遍，再来识别模式检验' },
+};
+function vDiagnosis() {
+  const w = topicWeakness(), keys = Object.keys(w);
+  let h = '';
+  const errs = {}; let tagged = 0;
+  progress.attempts.forEach(a => { if (a.err) { tagged++; errs[a.err] = (errs[a.err] || 0) + 1; } });
+  if (!keys.length) {
+    return '<div class="empty-state"><div class="e-icon">🩺</div><div class="e-title">还没有作答数据</div>' +
+      '<div class="e-sub">去练一局<b>题眼识别</b>或<b>限时闯关</b>，<br>系统会记录每次作答的对错、耗时和错因，<br>这里就能生成你的失分画像。</div>' +
+      '<button class="big-btn" data-action="start-identify" data-scope="' + esc(JSON.stringify(ALL_SCOPE)) + '">🎯 来一局题眼识别</button></div>';
+  }
+  /* 错因分布 */
+  const maxErr = Math.max(1, ...Object.values(errs));
+  h += '<div class="card-box"><div class="module-name" style="margin-bottom:4px">🧭 错因分布</div>' +
+    '<div class="module-sub" style="margin-bottom:10px">' + (tagged ? '共记录 ' + tagged + ' 条错因（答错时在反馈里点选）' : '答错过但没有标注错因——下次答错时点一下标签，推荐会更准') + '</div>';
+  if (tagged) {
+    ERR_TYPES.forEach(e => {
+      const n = errs[e.k] || 0; if (!n) return;
+      h += '<div class="bar-row"><span class="bar-name">' + e.label + '</span>' +
+        '<div class="bar-track"><i style="width:' + Math.round(n / maxErr * 100) + '%"></i></div>' +
+        '<span class="bar-n">' + n + '</span></div>';
+    });
+  } else {
+    const totalA = progress.attempts.length, wrongA = progress.attempts.filter(a => !a.ok).length;
+    h += '<div class="bar-row"><span class="bar-name">整体错误率</span><div class="bar-track"><i class="warm" style="width:' + (totalA ? Math.round(wrongA / totalA * 100) : 0) + '%"></i></div><span class="bar-n">' + wrongA + '/' + totalA + '</span></div>';
+  }
+  h += '</div>';
+  /* 推荐补练 */
+  const topErr = Object.keys(errs).sort((a, b) => errs[b] - errs[a])[0];
+  if (topErr && ERR_ADVICE[topErr]) {
+    h += '<div class="advice-box">🔍 你最频繁的失分原因是「' + ERR_ADVICE[topErr].t + '」<br>建议：' + ERR_ADVICE[topErr].s + '</div>';
+  }
+  /* 题型失分排行 */
+  const rows = keys.map(k => {
+    const t = w[k];
+    return { k, t, n: t.n, acc: t.wsum ? t.csum / t.wsum : 1, avgRt: t.rn ? Math.round(t.rsum / t.rn) / 1000 : 0 };
+  }).sort((a, b) => (a.acc - b.acc) || (b.n - a.n)).filter(r => r.t.moduleId && r.t.topicId);
+  h += '<div class="section-title">题型正确率 · 从低到高</div>';
+  rows.slice(0, 15).forEach(r => {
+    const tErr = Object.keys(r.t.errs).sort((a, b) => r.t.errs[b] - r.t.errs[a])[0];
+    h += '<div class="topic-row" data-action="open-topic" data-id="' + r.t.moduleId + '" data-topic="' + r.t.topicId + '">' +
+      '<div class="t-name">' + esc(r.t.topicName || r.t.moduleName) +
+      '<div style="font-size:11px;color:var(--text-3);font-weight:400;margin-top:2px">' + esc(r.t.moduleName) +
+      (tErr ? ' · 主因：' + (ERR_LABEL[tErr] || tErr) : '') + ' · 均耗时 ' + r.avgRt + 's</div></div>' +
+      '<div class="t-count" style="color:' + (r.acc < 0.5 ? 'var(--red)' : r.acc < 0.8 ? 'var(--amber)' : 'var(--green)') + '">' + Math.round(r.acc * 100) + '%<span style="color:var(--text-3);font-size:11px"> /' + r.n + '次</span></div>' +
+      '<div class="mini-progress">' + progressBar(Math.round(r.acc * 10), 10) + '</div>' +
+      '<svg class="chevron" viewBox="0 0 24 24" width="18" height="18"><path fill="currentColor" d="M9.3 6.7 8 8l5.3 4L8 16l1.3 1.3L16 12z"/></svg></div>';
+  });
+  h += '<div style="height:8px"></div>' +
+    '<button class="big-btn" data-action="start-identify" data-scope="' + esc(JSON.stringify(ALL_SCOPE)) + '">🎯 全库题眼识别 · 把弱项练成条件反射</button>';
+  h += '<div class="note-text" style="margin-top:10px">统计基于最近 ' + progress.attempts.length + ' 条作答记录（含闪卡/填空/闯关/识别）。正确率按时间加权：越近的回答影响越大，一周前答对的题会逐步让位给新数据。</div>';
+  return h;
+}
+
 /* ---------- 视图：我的 ---------- */
 function themeLabel(v) { return v === 'auto' ? '跟随系统' : v === 'light' ? '浅色' : '深色'; }
 function vProfile() {
@@ -304,15 +456,17 @@ function vProfile() {
     '<div class="p-stat"><b>' + days + '</b><span>学习天数</span></div></div>';
   h += '<div class="card-box"><div class="module-name" style="margin-bottom:6px">⚡ 闯关最佳成绩</div>' +
     '<div class="module-sub">' + (best.all ? '全题库模式 ' + best.all + ' 分' : '还没有成绩，去闯一关吧') + '</div></div>';
+  h += '<div class="set-row" data-action="open-diagnosis"><span class="s-label">🩺 弱项诊断</span><span class="s-val">' + (progress.attempts.length ? '已积累 ' + progress.attempts.length + ' 条作答记录' : '去看看错题画像') + '</span><svg class="chevron" viewBox="0 0 24 24" width="18" height="18"><path fill="currentColor" d="M9.3 6.7 8 8l5.3 4L8 16l1.3 1.3L16 12z"/></svg></div>';
   h += '<div class="section-title">设置</div>';
   h += '<div class="set-row" data-action="toggle-theme"><span class="s-label">🎨 外观主题</span><span class="s-val">' + themeLabel(progress.settings.theme) + '</span><svg class="chevron" viewBox="0 0 24 24" width="18" height="18"><path fill="currentColor" d="M9.3 6.7 8 8l5.3 4L8 16l1.3 1.3L16 12z"/></svg></div>';
   h += '<div class="set-row" data-action="export-data"><span class="s-label">💾 导出学习进度</span><span class="s-val">备份到文件</span></div>';
   h += '<label class="set-row"><span class="s-label">📂 导入学习进度</span><span class="s-val">从备份恢复</span><input type="file" accept=".json,application/json" class="file-input" id="import-input"></label>';
   h += '<div class="set-row danger" data-action="reset-confirm"><span class="s-label">🗑️ 清空学习进度</span></div>';
   h += '<div class="section-title">关于</div>' +
-    '<div class="note-text">「上岸闪记」面向在职考公人的碎片化记忆工具，当前覆盖江苏省考行测四大模块 ' + TOTAL + ' 张题眼卡片。<br><br>' +
+    '<div class="note-text">「上岸闪记」面向在职考公人的行测条件反射训练器：把「看到题 → 识别题眼 → 选对方法」练成第一反应。当前覆盖江苏省考行测五大模块 ' + TOTAL + ' 张卡片 + ' + IQS.length + ' 道真题风格识别题。<br><br>' +
     '📚 内容来源：以粉笔公考公开技巧体系为主干，辅以华图/中公等公开资料及网络考公经验帖整理，仅供个人学习记忆使用。<br><br>' +
-    '🧠 记忆原理：主动回忆（翻面前先想答案）+ 间隔重复（按记忆曲线安排复习），配合配对/填空/闯关多种提取练习，巩固题眼→解法的条件反射。<br><br>' +
+    '🎯 训练闭环：题眼识别（真实题干 8 秒判断第一步）→ 答错标注错因 → 弱项诊断生成画像与补练建议 → 间隔重复巩固。不追求掌握最多卡片，而是同样时间提高真实得分。<br><br>' +
+    '🧠 记忆原理：主动回忆（翻面前先想答案）+ 间隔重复（按记忆曲线安排复习），配合识别/配对/填空/闯关多种提取练习。<br><br>' +
     '📅 间隔规则：记住→间隔 1/2/4/7/15 天递进复习；模糊→次日重现；忘了→回到今天重新学。掌握标准：连续答对进入 3 级以上记忆盒。<br><br>' +
     '题库数据随 GitHub 仓库更新，祝早日上岸！🌊</div>';
   return h;
@@ -330,7 +484,7 @@ function openCardDetail(id) {
     '<div class="m-block"><div class="m-label">🔑 解法</div><div class="m-text">' + esc(cleanBack(c.back)) + '</div></div>' +
     '<div class="m-block"><div class="m-label">🏷 关键词</div><div class="kw-chips" style="justify-content:flex-start;margin:0">' + c.keywords.map(k => '<span class="kw-chip">' + esc(k) + '</span>').join('') + '</div></div>' +
     (c.mnemonic ? '<div class="m-block"><div class="m-label">💡 口诀</div><div class="mnemonic-box" style="margin-top:0">' + esc(c.mnemonic) + '</div></div>' : '') +
-    '<div class="m-block"><div class="m-label">来源</div><div class="m-text" style="font-size:12px;color:var(--text-3)">' + esc(c.source) + '</div></div>' +
+    '<div class="m-block"><div class="m-label">来源</div><div class="m-text" style="font-size:12px;color:var(--text-3)">' + esc(c.source) + (c.validUntil ? ' · ⏳' + esc(c.examYear || '') + '考前有效（至' + esc(c.validUntil) + '）' : '') + '</div></div>' +
     '<button class="big-btn" data-action="flash-single" data-id="' + c.id + '">🃏 用闪卡练这张</button>' +
     '</div>';
   $('#modal').classList.remove('hidden');
@@ -375,6 +529,150 @@ function resultPage(emoji, title, stats, canRestart) {
 }
 function accEmoji(p) { return p >= 0.85 ? '🎉' : p >= 0.6 ? '💪' : '📚'; }
 
+/* ---------- 错因选择器（识别/闯关/填空答错后展示） ---------- */
+function errChipsHtml() {
+  return '<div class="err-cause"><div class="ec-label">顺手记一下失分原因（可选，用于生成训练推荐）：</div><div class="err-chips">' +
+    ERR_TYPES.map(e => '<button class="err-chip" data-action="err-cause" data-cause="' + e.k + '">' + e.label + '</button>').join('') +
+    '</div></div>';
+}
+function onErrCause(k) {
+  if (!S) return;
+  if (S.type === 'identify') {
+    tagAttemptError(S.curAttempt, k);
+    S.curAttempt = null;
+    nextIdentify();
+  } else {
+    tagAttemptError(S.wrongRef, k);
+    const slot = document.getElementById('err-inline-slot');
+    if (slot) slot.innerHTML = '<div class="err-recorded">✅ 错因已记录：' + (ERR_LABEL[k] || '') + '</div>';
+  }
+}
+
+/* ---------- 模式〇：题眼识别（P0 核心训练） ---------- */
+const IDENTIFY_SEC = 8;
+function buildIdentifyQ(q) {
+  const perm = shuffle([0, 1, 2, 3]);
+  const opts = perm.map(i => q.options[i]);
+  const sc = { type: 'topic', moduleId: q.moduleId, topicId: q.topicId };
+  const linkCard = scopeCards(sc)[0];
+  return { q, opts, ans: perm.indexOf(q.answer), card: linkCard || null };
+}
+function startIdentify(scope) {
+  const ex = expandIqScope(scope);
+  const qs = shuffle(ex.qs).slice(0, 10);
+  if (!qs.length) { toast('这个范围还没有识别题'); return; }
+  S = {
+    type: 'identify', seq: ++SESSION_SEQ, scope: ex.scope, title: '题眼识别 · ' + scopeName(ex.scope),
+    qs: qs.map(buildIdentifyQ), i: 0, t0: Date.now(), endsAt: 0, timer: null,
+    phase: 'ask', picked: -1, curAttempt: null,
+    res: { ok: 0, bad: 0, to: 0, rsum: 0, rn: 0 }
+  };
+  openSession(); S.t0q = Date.now(); startIdentifyTimer(); renderSession();
+}
+function startIdentifyTimer() {
+  if (S.timer) clearInterval(S.timer);
+  S.endsAt = Date.now() + IDENTIFY_SEC * 1000;
+  S.timer = setInterval(tickIdentify, 200);
+}
+function stopIdentifyTimer() { if (S && S.timer) { clearInterval(S.timer); S.timer = null; } }
+function tickIdentify() {
+  if (!S || S.type !== 'identify') return;
+  if (S.phase !== 'ask') return;
+  const left = Math.max(0, S.endsAt - Date.now());
+  const bar = document.getElementById('id-timer-bar');
+  const hud = document.getElementById('id-time');
+  if (bar) bar.style.width = (left / (IDENTIFY_SEC * 1000) * 100) + '%';
+  if (hud) hud.textContent = (left / 1000).toFixed(1) + 's';
+  if (left <= 0) onIdentifyTimeout();
+}
+function renderIdentify() {
+  const total = S.qs.length, idx = S.i, cur = S.qs[idx];
+  let h = sTop('🎯 ' + S.title, (idx + 1) + ' / ' + total);
+  h += '<div class="session-body"><div class="timer-bar"><i id="id-timer-bar" style="width:' + (S.phase === 'ask' ? '100%' : '0%') + '"></i></div>';
+  if (S.phase === 'ask') {
+    h += '<div class="identify-hud"><div class="hud-item"><b id="id-time">' + IDENTIFY_SEC + '.0s</b><span>剩余时间</span></div>' +
+      '<div class="hud-item"><b>' + S.res.ok + '</b><span>已答对</span></div>' +
+      '<div class="hud-item"><b>' + S.res.bad + '</b><span>答错/超时</span></div></div>';
+  }
+  h += '<div class="quiz-q"><div class="q-label">📋 看到这道真题，你的第一步应该是？</div><div class="q-text">' + esc(cur.q.stem) + '</div>' +
+    '<div class="src-note" style="padding-top:8px;text-align:right">' + esc(cur.q.moduleName) + ' · ' + esc(cur.q.topicName) + '</div></div><div class="quiz-opts">';
+  cur.opts.forEach((o, i) => {
+    let cls = '';
+    if (S.phase === 'fb') {
+      if (i === cur.ans) cls = ' right';
+      else if (i === S.picked) cls = ' wrong';
+      else cls = ' dim';
+    }
+    h += '<button class="quiz-opt' + cls + '" data-action="identify-opt" data-idx="' + i + '">' + esc(o) + '</button>';
+  });
+  h += '</div>';
+  if (S.phase === 'fb') {
+    const right = S.picked === cur.ans;
+    h += '<div class="identify-explain">' +
+      '<div class="ie-line ie-ans">' + (right ? '✅ 判断正确！' : (S.picked === -1 ? '⏱ 超时了。' : '❌ 不对。')) + '第一步应：' + esc(cur.opts[cur.ans]) + '</div>' +
+      '<div class="ie-line">👁 题眼：' + esc(cur.q.why) + '</div>' +
+      '<div class="ie-line">⚠️ 易误判：' + esc(cur.q.trap) + '</div>' +
+      (right ? '' : errChipsHtml()) +
+      '</div>' +
+      '<div style="height:12px"></div>' +
+      '<button class="big-btn" data-action="identify-next">' + (idx + 1 >= total ? '查看结算' : '下一题 ▸') + '</button>';
+  } else {
+    h += '<div class="note-text" style="text-align:center;margin-top:10px">不求算出答案，只练 5–10 秒判断"第一步"</div>';
+  }
+  h += '</div>';
+  return h;
+}
+function logIdentifyAttempt(picked, rtMs) {
+  const cur = S.qs[S.i];
+  const ok = picked === cur.ans;
+  S.curAttempt = logAttempt({
+    kind: cur.card ? 'card' : 'iq', id: cur.card ? cur.card.id : cur.q.id,
+    moduleId: cur.q.moduleId, topicId: cur.q.topicId, topicName: cur.q.topicName, moduleName: cur.q.moduleName,
+    mode: 'identify', ok, rt: Math.round(rtMs), err: null
+  });
+  return ok;
+}
+function onIdentifyOpt(idx) {
+  if (!S || S.phase !== 'ask') return;
+  stopIdentifyTimer();
+  const rt = Date.now() - (S.t0q || S.t0);
+  S.picked = idx; S.phase = 'fb';
+  const ok = logIdentifyAttempt(idx, rt);
+  if (ok) S.res.ok++; else S.res.bad++;
+  S.res.rsum += rt; S.res.rn++;
+  if (ok) nextIdentify(); else renderSession();
+}
+function onIdentifyTimeout() {
+  if (!S || S.phase !== 'ask') return;
+  stopIdentifyTimer();
+  const rt = IDENTIFY_SEC * 1000;
+  S.picked = -1; S.phase = 'fb';
+  logIdentifyAttempt(-1, rt);
+  S.res.bad++; S.res.to++; S.res.rsum += rt; S.res.rn++;
+  renderSession();
+}
+function nextIdentify() {
+  if (!S) return;
+  S.curAttempt = null;
+  if (S.i + 1 >= S.qs.length) { stopIdentifyTimer(); renderIdentifyResult(); return; }
+  S.i++; S.phase = 'ask'; S.picked = -1;
+  S.t0q = Date.now();
+  startIdentifyTimer();
+  renderSession();
+}
+function renderIdentifyResult() {
+  stopIdentifyTimer();
+  const n = S.qs.length, acc = n ? S.res.ok / n : 0;
+  const avgRt = S.res.rn ? Math.round(S.res.rsum / S.res.rn) / 1000 : 0;
+  markStudy();
+  sessionEl().innerHTML = '<div class="session-top"><div class="s-title"></div></div>' +
+    resultPage(accEmoji(acc), acc >= 0.85 ? '条件反射初步成型！' : acc >= 0.6 ? '识别速度在提升' : '先回闪卡打地基', [
+      { b: S.res.ok + '/' + n, span: '判断正确' }, { b: Math.round(acc * 100) + '%', span: '识别正确率' },
+      { b: avgRt + 's', span: '平均反应时间' }, { b: S.res.to, span: '超时次数' }
+    ], true) +
+    (weakestTopic() ? '<div class="note-text" style="padding-bottom:20px">💡 想看看错在哪？去「弱项诊断」查看错因画像</div>' : '');
+}
+
 /* ---------- 模式一：闪卡 ---------- */
 function startFlash(scope, opts) {
   opts = opts || {};
@@ -391,7 +689,7 @@ function startFlash(scope, opts) {
     cards = due.concat(unseen, shuffle(rest)).slice(0, Math.max(20, due.length + 5));
   }
   if (!cards.length) { toast('这个范围暂时没有可学的卡片'); return; }
-  S = { type: 'flash', seq: ++SESSION_SEQ, scope, title: opts.cardId ? '单卡练习' : (opts.dueOnly ? '今日复习 · ' : '') + scopeName(scope), queue: cards.map(c => c.id), i: 0, flipped: false, againSet: {}, res: { again: 0, hard: 0, good: 0, easy: 0 } };
+  S = { type: 'flash', seq: ++SESSION_SEQ, scope, title: opts.cardId ? '单卡练习' : (opts.dueOnly ? '今日复习 · ' : '') + scopeName(scope), queue: cards.map(c => c.id), i: 0, flipped: false, againSet: {}, tShow: Date.now(), wrongRef: null, res: { again: 0, hard: 0, good: 0, easy: 0 } };
   openSession(); renderSession();
 }
 function renderFlash() {
@@ -405,7 +703,7 @@ function renderFlash() {
     '<div class="back-section"><div class="bs-text">' + esc(cleanBack(c.back)) + '</div></div>' +
     '<div class="kw-chips">' + c.keywords.map(k => '<span class="kw-chip">' + esc(k) + '</span>').join('') + '</div>' +
     (c.mnemonic ? '<div class="mnemonic-box">💡 ' + esc(c.mnemonic) + '</div>' : '') +
-    '<div class="src-note">' + esc(c.topicName) + ' · ' + esc(c.source) + '</div></div>' +
+    '<div class="src-note">' + esc(c.topicName) + ' · ' + esc(c.source) + (c.validUntil ? ' · ⏳' + esc(c.examYear || '') + '考前有效（至' + esc(c.validUntil) + '）' : '') + '</div></div>' +
     '</div></div></div>';
   if (!S.flipped) {
     h += '<div class="session-foot"><button class="show-answer-btn" data-action="flip-card">🤔 想好了，翻面对答案</button></div>';
@@ -420,11 +718,15 @@ function renderFlash() {
   return h;
 }
 function onGrade(g) {
-  const id = S.queue[S.i];
+  const id = S.queue[S.i], c = CARD_BY_ID[id];
   gradeCard(id, g);
+  logAttempt({
+    kind: 'card', id, moduleId: c.moduleId, topicId: c.topicId, topicName: c.topicName, moduleName: c.moduleName,
+    mode: 'flash', ok: g !== 'again', rt: Math.max(0, Date.now() - (S.tShow || Date.now())), err: null
+  });
   S.res[g]++;
   if (g === 'again' && !S.againSet[id]) { S.againSet[id] = 1; S.queue.push(id); }
-  S.i++; S.flipped = false;
+  S.i++; S.flipped = false; S.tShow = Date.now();
   if (S.i >= S.queue.length) { renderFlashResult(); return; }
   renderSession();
 }
@@ -528,7 +830,7 @@ function startFill(scope) {
   const ex = expandScope(scope);
   const cards = shuffle(ex.cards).slice(0, 10);
   if (cards.length < 4) { toast('卡片太少，换个范围试试'); return; }
-  S = { type: 'fill', seq: ++SESSION_SEQ, scope: ex.scope, title: '关键词填空 · ' + scopeName(ex.scope), qs: cards.map(c => buildFillQ(c, scopeCards(ex.scope))), i: 0, score: 0, locked: false };
+  S = { type: 'fill', seq: ++SESSION_SEQ, scope: ex.scope, title: '关键词填空 · ' + scopeName(ex.scope), qs: cards.map(c => buildFillQ(c, scopeCards(ex.scope))), i: 0, score: 0, locked: false, tShow: Date.now(), wrongRef: null };
   openSession(); renderSession();
 }
 function renderFill() {
@@ -561,11 +863,17 @@ function onQuizOpt(idx) {
   if (isRight) S.score++;
   markStudy();
   const c = q.card;
+  const rt = Math.max(0, Date.now() - (S.tShow || Date.now()));
+  S.wrongRef = logAttempt({
+    kind: 'card', id: c.id, moduleId: c.moduleId, topicId: c.topicId, topicName: c.topicName, moduleName: c.moduleName,
+    mode: 'fill', ok: isRight, rt, err: null
+  });
   const ex = document.getElementById('fill-explain');
   if (ex) ex.innerHTML = '<div class="quiz-explain">' + (isRight ? '✅ 答对了！' : '❌ 正确答案：' + esc(q.opts[q.ans]) + '。') +
-    (c.mnemonic ? '<br>💡 口诀：' + esc(c.mnemonic) : '') + '<br>🔑 ' + esc(cleanBack(c.back)) + '</div>';
+    (c.mnemonic ? '<br>💡 口诀：' + esc(c.mnemonic) : '') + '<br>🔑 ' + esc(cleanBack(c.back)) + '</div>' +
+    (isRight ? '' : '<div class="err-inline" id="err-inline-slot">' + errChipsHtml() + '</div>');
   const seq = S.seq;
-  setTimeout(() => { if (S && S.seq === seq && S.type === 'fill') { S.i++; S.locked = false; renderSession(); } }, isRight ? 1500 : 2400);
+  setTimeout(() => { if (S && S.seq === seq && S.type === 'fill') { S.i++; S.locked = false; S.tShow = Date.now(); renderSession(); } }, isRight ? 1500 : 2400);
 }
 
 /* ---------- 模式四：限时闯关 ---------- */
@@ -585,6 +893,7 @@ function buildChallengeQ() {
       if (!used.has(t)) { used.add(t); opts.push(t); }
     }
     const arr = shuffle(opts);
+    S.tShow = Date.now();
     return { label: '👁 看到这个题眼，该用什么解法？', q: cleanFront(card.front), opts: arr, ans: arr.indexOf(opts[0]), card };
   } else {
     opts.push(cut(cleanFront(card.front), 30)); used.add(opts[0]);
@@ -595,6 +904,7 @@ function buildChallengeQ() {
       if (!used.has(t)) { used.add(t); opts.push(t); }
     }
     const arr = shuffle(opts);
+    S.tShow = Date.now();
     return { label: '🔑 这个解法，对应哪个题眼？', q: cleanBack(card.back), opts: arr, ans: arr.indexOf(opts[0]), card };
   }
 }
@@ -630,7 +940,7 @@ function renderChallenge() {
     '<div class="quiz-q"><div class="q-label">' + S.cur.label + '</div><div class="q-text">' + esc(S.cur.q) + '</div></div>' +
     '<div class="quiz-opts">';
   S.cur.opts.forEach((o, i) => { h += '<button class="quiz-opt" data-action="quiz-opt" data-idx="' + i + '">' + esc(o) + '</button>'; });
-  h += '</div></div>';
+  h += '</div><div id="ch-explain"></div></div>';
   return h;
 }
 function onChallengeOpt(idx) {
@@ -644,6 +954,16 @@ function onChallengeOpt(idx) {
     else if (i === idx) el.classList.add('wrong');
     else el.classList.add('dim');
   });
+  logAttempt({
+    kind: 'card', id: cur.card.id, moduleId: cur.card.moduleId, topicId: cur.card.topicId,
+    topicName: cur.card.topicName, moduleName: cur.card.moduleName,
+    mode: 'challenge', ok: isRight, rt: Math.max(0, Date.now() - (S.tShow || Date.now())), err: null
+  });
+  if (!isRight) {
+    S.wrongRef = progress.attempts[progress.attempts.length - 1];
+    const slot = document.getElementById('ch-explain');
+    if (slot) slot.innerHTML = '<div class="err-inline">' + errChipsHtml() + '</div>';
+  }
   if (isRight) {
     S.correct++; S.combo++; S.maxCombo = Math.max(S.maxCombo, S.combo);
     S.score += 10 + (S.combo - 1) * 2;
@@ -651,8 +971,8 @@ function onChallengeOpt(idx) {
   const seq = S.seq;
   setTimeout(() => {
     if (!S || S.seq !== seq || S.done) return;
-    S.locked = false; S.cur = buildChallengeQ(); renderSession();
-  }, isRight ? 420 : 900);
+    S.locked = false; S.wrongRef = null; S.cur = buildChallengeQ(); renderSession();
+  }, isRight ? 420 : 1600);
 }
 function renderChallengeResult() {
   const acc = S.answered ? S.correct / S.answered : 0;
@@ -674,6 +994,7 @@ function renderSession() {
   else if (S.type === 'match') sessionEl().innerHTML = renderMatch();
   else if (S.type === 'fill') sessionEl().innerHTML = renderFill();
   else if (S.type === 'challenge') sessionEl().innerHTML = renderChallenge();
+  else if (S.type === 'identify') sessionEl().innerHTML = renderIdentify();
 }
 function restartSession() {
   if (!S) return;
@@ -683,6 +1004,7 @@ function restartSession() {
   if (t === 'flash') startFlash(sc);
   else if (t === 'match') startMatch(sc);
   else if (t === 'fill') startFill(sc);
+  else if (t === 'identify') startIdentify(sc);
   else startChallenge(sc);
 }
 
@@ -720,6 +1042,7 @@ function importData(file) {
     try {
       const p = JSON.parse(fr.result);
       if (!p || p.v !== 1 || !p.cards) throw 0;
+      if (!Array.isArray(p.attempts)) p.attempts = [];
       progress = p; saveProgress(); applyTheme(); render();
       toast('进度导入成功 ✅');
     } catch (e) { toast('文件格式不对，导入失败'); }
@@ -763,11 +1086,16 @@ document.addEventListener('click', e => {
     case 'start-match': startMatch(JSON.parse(el.dataset.scope)); break;
     case 'start-fill': startFill(JSON.parse(el.dataset.scope)); break;
     case 'start-challenge': startChallenge(JSON.parse(el.dataset.scope)); break;
+    case 'start-identify': startIdentify(JSON.parse(el.dataset.scope)); break;
+    case 'open-diagnosis': go('diagnosis'); break;
     case 'exit-session': closeSession(); break;
     case 'restart-session': restartSession(); break;
     case 'flip-card': if (S && S.type === 'flash' && !S.flipped) { S.flipped = true; renderSession(); } break;
     case 'grade': onGrade(el.dataset.grade); break;
     case 'match-item': onMatchItem(el.dataset.side, el.dataset.id); break;
+    case 'identify-opt': onIdentifyOpt(+el.dataset.idx); break;
+    case 'identify-next': nextIdentify(); break;
+    case 'err-cause': onErrCause(el.dataset.cause); break;
     case 'quiz-opt':
       if (S && S.type === 'fill') onQuizOpt(+el.dataset.idx);
       else if (S && S.type === 'challenge') onChallengeOpt(+el.dataset.idx);
